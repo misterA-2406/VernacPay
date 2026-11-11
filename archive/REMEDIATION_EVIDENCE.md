@@ -76,7 +76,7 @@
   * **Order ID:** `2UW4029938037114Y`
   * **HATEOAS Approval Link:** `https://www.sandbox.paypal.com/checkoutnow?token=2UW4029938037114Y`
 * **Real Buyer Approval:**
-  * **Buyer Account:** `sb-pj4347w53813178@personal.example.com`
+  * **Buyer Account:** `[MASKED_SANDBOX_BUYER]` (Configured via `PAYPAL_SANDBOX_BUYER_EMAIL`)
   * **Status Prior to Capture:** `APPROVED`
 * **Real PayPal Capture Result:**
   * **HTTP 201 Response from PayPal Sandbox:** `captureOrder('2UW4029938037114Y')`

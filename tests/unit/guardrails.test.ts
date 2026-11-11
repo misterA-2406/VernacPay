@@ -119,6 +119,24 @@ describe('VernacPay-Global: Architectural Guardrails & Trust Boundary Tests', ()
       const captureId = 'CAP_UNIQUE_TEST_01';
       const webhookEventId = 'WH_UNIQUE_EVT_8899';
 
+      // Seed known transaction in AWAITING_BUYER
+      await db.saveTransaction({
+        id: 'tx_idempotent_test_01',
+        merchant_id: 'merchant_pochampally_weavers_01',
+        paypal_order_id: orderId,
+        customer_name: 'David Miller',
+        customer_country: 'United States',
+        item_name: 'Pochampally Saree',
+        spoken_amount_inr: 12000,
+        settlement_amount_usd: 142.86,
+        settlement_currency: 'USD',
+        paypal_rail: 'ORDER',
+        shipment_status: 'NOT_SHIPPED',
+        status: 'AWAITING_BUYER',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+
       // 1st Webhook delivery
       const tx1 = await orchestrator.processVerifiedPaymentCapture({
         orderId,

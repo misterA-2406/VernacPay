@@ -38,7 +38,7 @@ export const AppHeader: React.FC = () => {
           service: data.service || 'VernacPay-Global v2.0',
           fxRate: data.fx_rate || 84.00,
           sandboxBuyer: data.sandbox_buyer || {
-            email: 'sb-pj4347w53813178@personal.example.com',
+            email: '',
             password: '••••••••',
           },
         });

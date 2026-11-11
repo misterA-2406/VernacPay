@@ -39,8 +39,8 @@ app.get('/api/health', (req: Request, res: Response) => {
     database_engine: db.isPostgres ? 'POSTGRESQL' : 'IN_MEMORY_PERSISTENT',
     fx_rate: fxService.getCurrentRate('INR', 'USD'),
     sandbox_buyer: {
-      email: process.env.PAYPAL_SANDBOX_BUYER_EMAIL || 'sb-pj4347w53813178@personal.example.com',
-      password: process.env.PAYPAL_SANDBOX_BUYER_PASSWORD || '5f87)Xy8',
+      email: process.env.PAYPAL_SANDBOX_BUYER_EMAIL || '',
+      password: process.env.PAYPAL_SANDBOX_BUYER_PASSWORD ? '••••••••' : '(See Devpost instructions)',
     },
     timestamp: new Date().toISOString(),
   });
@@ -175,6 +175,11 @@ app.post('/api/voice/process', upload.single('audio'), async (req: Request, res:
 
 // 10. Confirm Staged Financial Action (Explicit Merchant Authorization)
 app.post('/api/staged/confirm', async (req: Request, res: Response) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(`confirm_${clientIp}`, 15, 60 * 1000)) {
+    return res.status(429).json({ error: 'RATE_LIMIT_EXCEEDED', message: 'Too many confirmation attempts. Please wait a moment.' });
+  }
+
   try {
     const { authCode } = req.body;
     if (!authCode) {
@@ -210,16 +215,27 @@ app.post('/api/staged/cancel', async (req: Request, res: Response) => {
   }
 });
 
-// 12. Simulate Sandbox Payment Capture (Helper for judges / video recording)
+// 12. Simulate Sandbox Payment Capture (Reachable ONLY when DEMO_MODE === 'true')
 app.post('/api/sandbox/simulate-capture', async (req: Request, res: Response) => {
+  if (process.env.DEMO_MODE !== 'true') {
+    return res.status(404).json({
+      error: 'NOT_FOUND',
+      message: 'Simulation endpoint is disabled outside DEMO_MODE=true.',
+    });
+  }
+
   try {
     const { orderId, invoiceId } = req.body;
+    if (!orderId && !invoiceId) {
+      return res.status(400).json({ error: 'Missing orderId or invoiceId' });
+    }
     const updatedTx = await orchestrator.processVerifiedPaymentCapture({
       orderId,
       invoiceId,
+      captureId: `SIM_CAP_${Date.now()}`,
     });
     if (!updatedTx) {
-      return res.status(404).json({ error: 'No matching transaction to capture' });
+      return res.status(404).json({ error: 'No matching transaction to capture in merchant ledger' });
     }
     res.json({ success: true, transaction: updatedTx });
   } catch (err: any) {
@@ -229,6 +245,11 @@ app.post('/api/sandbox/simulate-capture', async (req: Request, res: Response) =>
 
 // 13. PayPal Webhook Receiver
 app.post('/api/paypal/webhook', async (req: Request, res: Response) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(`wh_${clientIp}`, 60, 60 * 1000)) {
+    return res.status(429).json({ error: 'RATE_LIMIT_EXCEEDED' });
+  }
+
   try {
     const verification = await paypalService.verifyWebhookSignature({
       headers: req.headers as Record<string, string>,
@@ -240,29 +261,34 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response) => {
         stage: '5. WEBHOOK VERIFIED & LEDGER LOCKED',
         actionName: 'webhook_signature_check',
         status: 'REJECTED',
-        details: 'Rejected unverified PayPal webhook signature.',
+        details: `Rejected invalid PayPal webhook signature: ${verification.message}`,
       });
-      return res.status(400).send('Invalid signature');
+      return res.status(400).send(`Invalid signature: ${verification.message}`);
     }
 
     const event = req.body;
     const eventType = event.event_type;
     const eventId = event.id;
 
-    if (eventType === 'INVOICING.INVOICE.PAID') {
+    // Process ONLY PAYMENT.CAPTURE.COMPLETED (Orders v2 primary rail)
+    // CHECKOUT.ORDER.APPROVED is intentionally NOT treated as paid because money has not been captured!
+    if (eventType === 'PAYMENT.CAPTURE.COMPLETED') {
       const resource = event.resource;
-      const invoiceId = resource.id;
-      const captureId = resource.payments?.[0]?.payment_id || `PAY_${Date.now()}`;
+      const captureId = resource?.id;
+      const orderId = resource?.supplementary_data?.related_ids?.order_id;
 
-      await orchestrator.processVerifiedPaymentCapture({
-        invoiceId,
-        captureId,
-        webhookEventId: eventId,
-      });
-    } else if (eventType === 'PAYMENT.CAPTURE.COMPLETED' || eventType === 'CHECKOUT.ORDER.APPROVED') {
-      const resource = event.resource;
-      const orderId = resource.id || resource.supplementary_data?.related_ids?.order_id;
-      const captureId = resource.id;
+      if (!orderId || !captureId) {
+        return res.status(200).json({ received: true, ignored: true, reason: 'Missing orderId or captureId' });
+      }
+
+      // Check if order exists in our own ledger before touching state
+      const txs = await db.listTransactions();
+      const existingTx = txs.find(t => t.paypal_order_id === orderId || t.id === orderId);
+      if (!existingTx) {
+        // Unknown order: return 200 acknowledged but write nothing
+        console.warn(`[Webhook] Ignored PAYMENT.CAPTURE.COMPLETED for unknown order ${orderId}`);
+        return res.status(200).json({ received: true, ignored: true, reason: 'Order not found in merchant ledger' });
+      }
 
       await orchestrator.processVerifiedPaymentCapture({
         orderId,
@@ -278,8 +304,47 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response) => {
   }
 });
 
+function renderReceiptHtml(orderId: string, captureId?: string): string {
+  return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Payment Successful - VernacPay-Global</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; background: #07111F; color: #F8FAFC; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+          .card { background: #0D1929; border: 1px solid rgba(24, 201, 149, 0.3); border-radius: 16px; padding: 32px; max-width: 440px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+          .icon { width: 56px; height: 56px; background: rgba(24, 201, 149, 0.15); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; color: #18C995; font-size: 28px; }
+          h1 { font-size: 20px; margin: 0 0 8px; color: #18C995; }
+          p { font-size: 14px; color: #94A3B8; margin: 0 0 20px; line-height: 1.5; }
+          .badge { display: inline-block; background: #162840; padding: 6px 12px; border-radius: 8px; font-family: monospace; font-size: 12px; color: #38BDF8; margin-bottom: 8px; }
+          .capture { font-family: monospace; font-size: 11px; color: #10B981; margin-bottom: 24px; }
+          a { display: inline-block; background: #18C995; color: #020617; font-weight: 600; text-decoration: none; padding: 10px 24px; border-radius: 10px; font-size: 14px; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="icon">✓</div>
+          <h1>Payment Verified via PayPal Sandbox</h1>
+          <p>Your cross-border payment has been captured and cryptographically recorded on the exporter's immutable ledger.</p>
+          <div class="badge">Order ID: ${orderId}</div>
+          ${captureId ? `<div class="capture">Capture ID: ${captureId}</div>` : ''}
+          <div>
+            <a href="/?payment_success=true&order_id=${orderId}">Return to VernacPay Dashboard</a>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 // 14. PayPal Return URL Handler (Fallback for Webhook Delay / Direct Buyer Capture)
 app.get('/api/paypal/return', async (req: Request, res: Response) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(`return_${clientIp}`, 15, 60 * 1000)) {
+    return res.status(429).send('Rate limit exceeded: please slow down.');
+  }
+
   try {
     const orderId = (req.query.token || req.query.orderId) as string;
     const payerId = req.query.PayerID as string;
@@ -288,8 +353,28 @@ app.get('/api/paypal/return', async (req: Request, res: Response) => {
       return res.status(400).send('Missing PayPal Order Token');
     }
 
+    // Verify order exists in our own ledger BEFORE calling PayPal
+    const txs = await db.listTransactions();
+    const tx = txs.find(t => t.paypal_order_id === orderId || t.id === orderId);
+    if (!tx) {
+      return res.status(404).send('Order not found in merchant ledger');
+    }
+
+    // If order is already VERIFIED_PAID, return existing receipt with NO write
+    if (tx.status === 'VERIFIED_PAID') {
+      return res.send(renderReceiptHtml(orderId, tx.paypal_capture_id));
+    }
+
+    // Capture ONLY orders in AWAITING_BUYER status
+    if (tx.status !== 'AWAITING_BUYER') {
+      return res.status(400).send(`Order cannot be captured in status: ${tx.status}`);
+    }
+
     // Capture payment synchronously
     const captureResult = await paypalService.captureOrder(orderId);
+    if (!captureResult.capture_id) {
+      return res.status(500).send('PayPal capture completed without returning a capture ID');
+    }
 
     // Process verified capture in orchestrator with idempotency
     const updatedTx = await orchestrator.processVerifiedPaymentCapture({
@@ -302,38 +387,10 @@ app.get('/api/paypal/return', async (req: Request, res: Response) => {
       stage: '5. WEBHOOK VERIFIED & LEDGER LOCKED',
       actionName: 'return_url_capture',
       status: 'SUCCESS',
-      details: `PayPal return URL captured synchronously for Order ${orderId} (Payer: ${payerId || 'Sandbox Buyer'}).`,
+      details: `PayPal return URL captured synchronously for Order ${orderId} (Capture: ${captureResult.capture_id}, Payer: ${payerId || 'Sandbox Buyer'}).`,
     });
 
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Payment Successful - VernacPay-Global</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body { font-family: system-ui, -apple-system, sans-serif; background: #07111F; color: #F8FAFC; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
-            .card { background: #0D1929; border: 1px solid rgba(24, 201, 149, 0.3); border-radius: 16px; padding: 32px; max-width: 440px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
-            .icon { width: 56px; height: 56px; background: rgba(24, 201, 149, 0.15); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; color: #18C995; font-size: 28px; }
-            h1 { font-size: 20px; margin: 0 0 8px; color: #18C995; }
-            p { font-size: 14px; color: #94A3B8; margin: 0 0 20px; line-height: 1.5; }
-            .badge { display: inline-block; background: #162840; padding: 6px 12px; border-radius: 8px; font-family: monospace; font-size: 12px; color: #38BDF8; margin-bottom: 24px; }
-            a { display: inline-block; background: #18C995; color: #020617; font-weight: 600; text-decoration: none; padding: 10px 24px; border-radius: 10px; font-size: 14px; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <div class="icon">✓</div>
-            <h1>Payment Verified via PayPal Sandbox</h1>
-            <p>Your cross-border payment has been captured and cryptographically recorded on the exporter's immutable ledger.</p>
-            <div class="badge">Order ID: ${orderId}</div>
-            <div>
-              <a href="/?payment_success=true&order_id=${orderId}">Return to VernacPay Dashboard</a>
-            </div>
-          </div>
-        </body>
-      </html>
-    `);
+    res.send(renderReceiptHtml(orderId, captureResult.capture_id));
   } catch (err: any) {
     console.error('[PayPal Return Error]:', err);
     res.status(500).send('Error processing payment capture: ' + err.message);
@@ -342,26 +399,42 @@ app.get('/api/paypal/return', async (req: Request, res: Response) => {
 
 // 15. Real-Time Order Polling Fallback (For instant UI updates while webhook travels)
 app.get('/api/paypal/order-status/:orderId', async (req: Request, res: Response) => {
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(`poll_${clientIp}`, 30, 60 * 1000)) {
+    return res.status(429).json({ error: 'RATE_LIMIT_EXCEEDED' });
+  }
+
   try {
     const orderId = String(req.params.orderId);
     const txs = await db.listTransactions();
     const tx = txs.find(t => t.paypal_order_id === orderId || t.id === orderId);
 
-    if (tx && tx.status === 'VERIFIED_PAID') {
+    // Order must exist in our ledger
+    if (!tx) {
+      return res.status(404).json({ error: 'Order not found in merchant ledger' });
+    }
+
+    // If already verified paid, return immediately with zero writes
+    if (tx.status === 'VERIFIED_PAID') {
       return res.json({ status: 'VERIFIED_PAID', transaction: tx });
     }
 
-    // Check with live PayPal
-    const liveOrder = await paypalService.getOrder(orderId);
-    if (liveOrder && (liveOrder.status === 'COMPLETED' || liveOrder.status === 'APPROVED')) {
-      const updatedTx = await orchestrator.processVerifiedPaymentCapture({
-        orderId,
-        captureId: liveOrder.purchase_units?.[0]?.payments?.captures?.[0]?.id || `CAP_${orderId}`,
-      });
-      return res.json({ status: 'VERIFIED_PAID', transaction: updatedTx });
+    // Check with live PayPal ONLY if order is awaiting buyer
+    if (tx.status === 'AWAITING_BUYER') {
+      const liveOrder = await paypalService.getOrder(orderId);
+      const capture = liveOrder?.purchase_units?.[0]?.payments?.captures?.[0];
+      // Only capture status COMPLETED with a REAL capture ID triggers state transition
+      if (liveOrder?.status === 'COMPLETED' && capture?.id && (capture?.status === 'COMPLETED' || capture?.status === 'SUCCESS')) {
+        const updatedTx = await orchestrator.processVerifiedPaymentCapture({
+          orderId,
+          captureId: capture.id,
+        });
+        return res.json({ status: 'VERIFIED_PAID', transaction: updatedTx });
+      }
+      return res.json({ status: tx.status, liveStatus: liveOrder?.status });
     }
 
-    res.json({ status: tx?.status || 'AWAITING_BUYER', liveStatus: liveOrder?.status });
+    res.json({ status: tx.status });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -393,10 +466,39 @@ app.get('*', (req: Request, res: Response) => {
 // --- Server Startup & Auto-Seeding ---
 async function startServer() {
   await db.init();
-  // Auto-seed if database is empty
-  const existing = await db.listTransactions();
-  if (existing.length === 0) {
-    await seedDatabase();
+
+  // In production (DEMO_MODE !== 'true'), do NOT load seed or demo transactions: ledger starts empty!
+  if (process.env.DEMO_MODE === 'true' || process.env.NODE_ENV !== 'production') {
+    const existing = await db.listTransactions();
+    if (existing.length === 0) {
+      await seedDatabase();
+    }
+  }
+
+  // Production Startup Security Guards
+  if (process.env.NODE_ENV === 'production' && process.env.DEMO_MODE !== 'true') {
+    const paypalId = process.env.PAYPAL_CLIENT_ID;
+    const paypalSecret = process.env.PAYPAL_CLIENT_SECRET;
+    const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+    const sarvamKey = process.env.SARVAM_API_KEY;
+    const groqKey = process.env.GROQ_API_KEY;
+
+    if (!paypalId || paypalId.startsWith('mock-') || paypalId.includes('your_paypal')) {
+      throw new Error('[CRITICAL CONFIG ERROR] PAYPAL_CLIENT_ID must be set to a live sandbox client ID in production.');
+    }
+    if (!paypalSecret || paypalSecret.startsWith('mock-')) {
+      throw new Error('[CRITICAL CONFIG ERROR] PAYPAL_CLIENT_SECRET must be set to a live sandbox client secret in production.');
+    }
+    if (!webhookId || webhookId.startsWith('mock-') || webhookId.length < 10) {
+      throw new Error('[CRITICAL CONFIG ERROR] PAYPAL_WEBHOOK_ID must be configured with a registered PayPal webhook ID in production.');
+    }
+    if (!sarvamKey || sarvamKey.startsWith('mock-') || sarvamKey.includes('your_sarvam')) {
+      throw new Error('[CRITICAL CONFIG ERROR] SARVAM_API_KEY must be set in production.');
+    }
+    if (!groqKey || groqKey.startsWith('mock-') || groqKey.includes('your_groq')) {
+      throw new Error('[CRITICAL CONFIG ERROR] GROQ_API_KEY must be set in production.');
+    }
+    console.log('[Security Startup Guard] All production API credentials & Webhook ID validated.');
   }
 
   app.listen(port, () => {
